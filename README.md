@@ -135,6 +135,22 @@ npm start
 
 页面上：跳过行以紫色「已跳过」徽标与置灰底色展示，重算时段与实际/预计时间列显示「—」，实际开始列附跳过原因标签；舞监可点「跳过原因」回看详情；版本列表新增「已跳过」计数；执行账号的现场页对跳过项只读且无登记按钮。
 
+#### 现场顺延预演（本轮新增）
+
+现场发生顺延时，舞监在「现场联排」页点「**填写假设并重算预演…**」（或在某行点「**顺延预演**」直接预填该行），对**当前执行版**的一项或多项**未完成、未跳过**提示项填写**假设预计结束时间**，查看变更前后差异：
+
+- **同时套用、一次重算**：预演以**同一次读取的当前执行版与全部登记行快照**为基线，把全部假设**一次性**套用后，按现有前置顺延与跳过规则重算（不是逐条串行试算），因此同批假设之间的联动（如前置项也被假设）会正确传导；重算开始仍不早于原计划，跳过项仍不计入待执行时段与冲突；
+- **逐项差异**：结果弹窗逐行列出原计划时段、**变更前（基线）待执行开始/结束**、**变更后（预演）待执行开始/结束**及开始/结束的分钟差（推迟红色、回缩绿色），假设项有蓝色标记；
+- **冲突对照**：同岗位冲突按「岗位 + 双方提示项」稳定配对，分为**🔴 新增、🟢 消失、🟠 仍存在**（仍存在且时段变化时同时给出变更前后消息），顶部汇总「基线 N 项 → 预演 M 项」；
+- **假设边界（不满足整体拒绝，逐项给出原因，HTTP 400 `WHATIF_INVALID`）**：
+  - 仅**未开始 / 已开始（RUNNING）且未完成、未跳过**项可假设；**已完成、已跳过项明确拒绝**；
+  - **已开始项**的假设预计结束**不得早于实际开始**；
+  - **未开始项**不得早于**预演算出的开始**（按全部假设套用后的开始计算，而不是基线开始）；
+  - **无效时间**（非 HH:MM）、**重复项**（同一 cueRef 出现两次）明确拒绝；
+- **一致读取，拒绝混合时点**：请求必须携带**所见版本 `versionId` 与全部提示项登记行版本 `rows[]`**。服务端在同一事务内核对：版本已归档（409 `VERSION_STALE`）、登记行数量/引用不一致、任一登记行版本已变化（409 `WHATIF_STALE`，逐项列出当前版本）均**整体拒绝**，请刷新页面后重新预演，绝不返回混合时点结果；
+- **只读**：预演**不更改任何登记、已发布计划、跳过状态与更正历史**，也不推进任何行版本；结果页可点「调整假设重新预演」反复试算；如需落实，仍由岗位按既有流程登记或由舞监更正；
+- 仅**舞监**可调用（执行账号 403）；仅**当前执行版**可预演；也可通过 HTTP API `POST /api/live/whatif` 获取与页面完全同等的结果（见第十二节示例）。
+
 #### 排期来源解释（本轮新增）
 
 现场发现某提示项顺延时，舞监与执行岗位都可在「现场联排」页（当前执行版）或「发布版本」回看页（历史版本）点该行的「**来源**」按钮，查看其**排期开始时刻如何形成**：
@@ -170,6 +186,7 @@ npm start
 - 现场登记按「提示项行版本号」校验：两位岗位同时操作同一提示项时，先提交者成功，后提交者收到 409 明确报错并刷新；
 - **舞监更正与岗位登记共用同一条登记行版本号**：任一方更新后行版本 +1，另一方（或持旧页面重复提交）会收到 409 拒绝并被要求刷新，确保更正不能覆盖新登记、新登记也不能覆盖更正。
 - **依赖链跳过同样以链中每项的登记行版本号为乐观锁**：确认必须回传预览所见的每个 `rowVersion`；预览后任一项被登记或更正（行版本推进），整次跳过 409 拒绝；跳过成功后新跳过项行版本 +1（已跳过项不重复更新）。
+- **现场顺延预演（只读）在单次事务内同时核对所见执行版与全部提示项登记行版本**：请求必须携带 `versionId` 与 `rows: [{cueRef, rowVersion}]`（全部提示项，一项不能少）；版本已归档、行集合与当前版本不一致、或任一登记行版本已推进，均以 409 `WHATIF_STALE` 整体拒绝并逐项给出当前行版本，不会返回基于混合时点的预演结果；预演不推进任何版本号、不写入数据，可对同一快照反复试算。
 
 ## 五、配置项（环境变量）
 
@@ -227,6 +244,7 @@ SESSION_SECRET=your-long-random-secret
 | POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史；已跳过项 409 `CUE_SKIPPED`） |
 | GET | `/api/live/skips/preview` | 舞监 | **依赖链跳过影响预览**（仅当前执行版）：根项及沿前置可达的全部后继、各项行版本、阻断项与已跳过原因 |
 | POST | `/api/live/skips` | 舞监 | **确认跳过整条依赖链**（非空原因 + 预览所见行版本；事务内核验，阻断/版本变化整体拒绝；首跳清除预计结束并留痕，已跳过项不重复留痕） |
+| POST | `/api/live/whatif` | 舞监 | **现场顺延预演**（仅当前执行版，只读）：携带 `versionId`、全部登记行 `rows[]` 与一项或多项假设 `assumptions[]`；同一快照同时套用全部假设重算，返回逐项待执行开始/结束差异与新增/消失/仍存在的同岗位冲突；版本或任一行变化整体 409 `WHATIF_STALE`，无效假设 400 `WHATIF_INVALID`，不写入任何数据 |
 | GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`）与历史回看（每行含更正历史 `corrections` 与跳过留痕 `skip`） |
 | GET | `/api/versions/:id/cues/:cueRef/explain` | 已登录 | **排期开始来源解释**（当前执行版与历史版本通用，只读）：以原计划开始为基线，达到最终最大约束时刻的直接前置全部列出并逐层追溯来源；目标已开始/已完成/已跳过返回明确说明 |
 
@@ -641,3 +659,140 @@ HTTP 200
 - 登记、舞监更正或依赖链跳过后，重新打开「来源」弹窗（或刷新页面）即可看到新解释；历史版本按归档状态只读回看，不随新登记变化之外的任何写操作影响（解释接口本身不写入任何数据）。
 
 
+## 十二、现场顺延预演 API 调用示例（本轮新增）
+
+以本地默认端口 3000、舞监账号为例（`curl -c/-b` 复用会话 Cookie）。仅舞监可调用，仅当前执行版可用，接口**只读**：不更改登记、已发布计划、跳过状态与更正历史。
+
+请求体三部分：
+
+- `versionId`：页面所见的当前执行版 id；
+- `rows`：**当前版本全部提示项**的登记行 `{cueRef, rowVersion}`（取自 `GET /api/live` 每行的 `id` 与 `rowVer`，一项不能少）；
+- `assumptions`：一项或多项假设 `{cueRef, estimatedEndText}`（HH:MM），仅可针对未完成、未跳过提示项。
+
+### 1. 登录并获取当前版本与全部行版本
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"sm","password":"sm12345"}'
+
+# 取当前执行版 id、每行 cueRef(id) 与 rowVer
+curl -b sm.cookie -s http://localhost:3000/api/live
+```
+
+### 2. 提交多项假设，查看变更前后逐项差异与冲突变化
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/whatif \
+  -H 'Content-Type: application/json' -d '{
+    "versionId": 3,
+    "rows": [
+      {"cueRef": 1, "rowVersion": 1}, {"cueRef": 2, "rowVersion": 1},
+      {"cueRef": 3, "rowVersion": 1}, {"cueRef": 4, "rowVersion": 1},
+      {"cueRef": 5, "rowVersion": 1}, {"cueRef": 6, "rowVersion": 1},
+      {"cueRef": 7, "rowVersion": 1}
+    ],
+    "assumptions": [
+      {"cueRef": 1, "estimatedEndText": "19:22"}
+    ]
+  }'
+```
+
+响应要点（`baseline*` 为变更前、`scenario*` 为同时套用全部假设后）：
+
+```json
+{
+  "versionId": 3, "versionNo": 3, "isLatest": true,
+  "readAt": "2026-10-04 19:02:11", "readOnly": true,
+  "assumptions": [{ "cueRef": 1, "code": "L1", "estimatedEndText": "19:22" }],
+  "summary": {
+    "cueCount": 7, "assumedCount": 1, "changedCount": 6,
+    "baselineConflictCount": 0, "scenarioConflictCount": 2,
+    "addedCount": 2, "removedCount": 0, "keptCount": 0
+  },
+  "cues": [
+    { "cueRef": 1, "code": "L1", "status": "PENDING", "assumed": true,
+      "plannedStartText": "19:00", "plannedEndText": "19:05",
+      "baselineStartText": "19:00", "baselineEndText": "19:05",
+      "scenarioStartText": "19:00", "scenarioEndText": "19:22",
+      "startDeltaMinutes": 0, "endDeltaMinutes": 13, "changed": true, "delayed": false }
+  ],
+  "conflictsAdded": [
+    { "position": "灯光", "aRef": 4, "bRef": 7, "codes": ["L2", "L4"],
+      "message": "岗位「灯光」执行时段冲突：「L2」(19:25-19:33) 与「L4」(19:30-19:36)" }
+  ],
+  "conflictsRemoved": [],
+  "conflictsKept": []
+}
+```
+
+- `cues[].baselineStartText/baselineEndText`、`scenarioStartText/scenarioEndText`：变更前后**待执行开始/结束**（已跳过项均为 `null`）；
+- `startDeltaMinutes/endDeltaMinutes`：预演相对基线的分钟差（正数推迟、负数回缩、0 无变化）；`assumed=true` 标记假设项；
+- `conflictsAdded`（🔴 新增）/ `conflictsRemoved`（🟢 消失，消息描述基线时段）/ `conflictsKept`（🟠 仍存在，含 `baseline` 与 `scenario` 两条消息，时段变化时可前后对照）。
+
+### 3. 同批假设联动：前置项与后继项同时给假设
+
+假设会**一次性同时套用**再按前置规则重算：下例中 S1 未开始，其预演开始由同批 L1 假设推到 19:22，故 S1 的假设结束 19:30 合法（不早于预演开始）；L2/S2 随之从 19:30 起。
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/whatif \
+  -H 'Content-Type: application/json' -d '{
+    "versionId": 3,
+    "rows": [ {"cueRef":1,"rowVersion":1}, {"cueRef":2,"rowVersion":1}, {"cueRef":3,"rowVersion":1},
+              {"cueRef":4,"rowVersion":1}, {"cueRef":5,"rowVersion":1}, {"cueRef":6,"rowVersion":1},
+              {"cueRef":7,"rowVersion":1} ],
+    "assumptions": [
+      {"cueRef": 1, "estimatedEndText": "19:22"},
+      {"cueRef": 2, "estimatedEndText": "19:30"}
+    ]
+  }'
+```
+
+### 4. 冲突消失：把导致顺延的假设回缩
+
+当基线冲突来自某项既有预计结束（岗位登记或舞监更正），可对该项预演一个更早的假设（未开始项允许早于既有预计，只要不早于预演开始），`conflictsRemoved` 给出随假设消失的冲突；`summary.baselineConflictCount` 大于 0、`scenarioConflictCount` 为 0。
+
+### 5. 无效假设 / 版本变化：整体拒绝
+
+| 场景 | 状态码 | error |
+| --- | --- | --- |
+| 未登录 / 执行账号调用 | 401 / 403 | `UNAUTHORIZED` / `FORBIDDEN` |
+| 尚未发布任何版本 | 409 | `NO_LIVE_VERSION` |
+| 携带的 `versionId` 已不是当前执行版 | 409 | `VERSION_STALE` |
+| 版本不存在 / cueRef 不在版本中（行数量或引用不一致） | 404 / 409 | `NOT_FOUND` / `WHATIF_STALE` |
+| 任一登记行版本已变化（岗位登记、舞监更正、跳过推进了 rowVer） | 409 | `WHATIF_STALE`（`items` 逐项给出 `previewRowVersion/currentRowVersion`） |
+| 时间格式无效、同一 cueRef 重复（请求级或假设级） | 400 | `BAD_INPUT` / `WHATIF_INVALID` |
+| 对已完成 / 已跳过项填写假设 | 400 | `WHATIF_INVALID`（逐项原因） |
+| 已开始项假设早于实际开始；未开始项假设早于预演算出的开始 | 400 | `WHATIF_INVALID`（逐项原因） |
+| 假设列表为空 | 400 | `WHATIF_INVALID` |
+
+典型 409 响应（整体拒绝，前端应整页刷新后重新预演）：
+
+```json
+HTTP 409
+{
+  "error": "WHATIF_STALE",
+  "message": "执行版或登记行已变化（1 项），本次预演已整体拒绝，请刷新后重新预演",
+  "items": [
+    { "cueRef": 1, "code": "L1", "previewRowVersion": 1, "currentRowVersion": 2,
+      "reason": "「L1」登记行版本已变化（提交基于 v1，当前 v2，可能被岗位登记、舞监更正或跳过更新），请刷新后重新预演" }
+  ],
+  "currentVersionId": 3, "currentVersionNo": 3
+}
+```
+
+典型 400 响应（逐项列出不成立的假设，不写入任何数据）：
+
+```json
+HTTP 400
+{
+  "error": "WHATIF_INVALID",
+  "message": "1 项假设不成立，本次预演已整体拒绝（未更改任何登记、计划与更正历史）",
+  "items": [
+    { "cueRef": 2, "code": "S1",
+      "reason": "「S1」未开始：假设预计结束 19:00 早于预演算出的开始 19:05" }
+  ]
+}
+```
+
+预演全程只读：重复调用、试算不同假设均不会改变 `GET /api/live` 的任何结果（登记时间、行版本、冲突、更正历史保持原样）。

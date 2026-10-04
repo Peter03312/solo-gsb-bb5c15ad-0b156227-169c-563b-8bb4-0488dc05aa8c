@@ -9,7 +9,7 @@ const session = require('express-session');
 const { db, getMeta, setMeta } = require('./db');
 const { verifyPassword } = require('./auth');
 const { init } = require('./initdb');
-const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule } = require('./scheduling');
+const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule, simulateWhatIf } = require('./scheduling');
 
 init();
 
@@ -1393,6 +1393,161 @@ app.post('/api/live/skips', requireSM, (req, res, next) => {
 function closureSizeFor(versionId, rootRef) {
   return successorClosure(versionId, rootRef).size;
 }
+
+// ---------- 舞监：现场顺延预演（仅当前执行版，只读） ----------
+
+// 请求体：{ versionId, rows: [{cueRef, rowVersion}]（全部提示项登记行）,
+//           assumptions: [{cueRef, estimatedEndText}]（一项或多项未完成、未跳过提示项的假设预计结束） }
+app.post('/api/live/whatif', requireSM, (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const versionId = Number(body.versionId);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的 versionId');
+
+    // 结构解析：rows / assumptions 必须为数组，且至少一项假设
+    const rawRows = body.rows;
+    const rawAssumptions = body.assumptions;
+    if (!Array.isArray(rawRows)) {
+      throw new ApiError(400, 'BAD_INPUT', 'rows 应为全部提示项登记行数组 [{cueRef, rowVersion}]');
+    }
+    if (!Array.isArray(rawAssumptions)) {
+      throw new ApiError(400, 'BAD_INPUT', 'assumptions 应为数组 [{cueRef, estimatedEndText}]');
+    }
+
+    const seenRow = new Set();
+    const rows = [];
+    for (const it of rawRows) {
+      const cueRef = Number(it?.cueRef);
+      const rowVersion = Number(it?.rowVersion);
+      if (!Number.isInteger(cueRef) || !Number.isInteger(rowVersion)) {
+        throw new ApiError(400, 'BAD_INPUT', 'rows 每项须包含整数 cueRef 与 rowVersion（请基于当前页面全部提示项登记行提交）');
+      }
+      if (seenRow.has(cueRef)) {
+        throw new ApiError(400, 'WHATIF_INVALID', '请求中的登记行存在重复 cueRef，请刷新后重新预演');
+      }
+      seenRow.add(cueRef);
+      rows.push({ cueRef, rowVersion });
+    }
+
+    const seenAssumed = new Set();
+    const assumptionsParsed = [];
+    const invalid = [];
+    for (const it of rawAssumptions) {
+      const cueRef = Number(it?.cueRef);
+      if (!Number.isInteger(cueRef)) {
+        throw new ApiError(400, 'BAD_INPUT', 'assumptions 每项须包含整数 cueRef');
+      }
+      if (seenAssumed.has(cueRef)) {
+        invalid.push({ cueRef, code: null, reason: `提示项引用 ${cueRef} 的假设重复提交（同一提示项只能填写一项假设）` });
+        continue;
+      }
+      seenAssumed.add(cueRef);
+      const text = it?.estimatedEndText;
+      const estimatedEnd = timeToMin(text);
+      if (estimatedEnd === null) {
+        invalid.push({ cueRef, code: null, reason: `提示项引用 ${cueRef} 的假设预计结束时间无效（应为 HH:MM）` });
+        continue;
+      }
+      assumptionsParsed.push({ cueRef, estimatedEnd, estimatedEndText: minToTime(estimatedEnd) });
+    }
+    if (invalid.length) {
+      throw new ApiError(400, 'WHATIF_INVALID',
+        `${invalid.length} 项假设格式无效，本次预演已整体拒绝`, { items: invalid });
+    }
+    if (assumptionsParsed.length === 0) {
+      throw new ApiError(400, 'WHATIF_INVALID',
+        '请至少为一项未完成、未跳过的提示项填写假设预计结束', { items: [] });
+    }
+
+    // 单次事务读取一致快照：当前执行版、全部登记行版本同时核对，任一变化即整体提示刷新，
+    // 绝不返回混合时点结果。预演只读，事务内不做任何写入。
+    const result = db.transaction(() => {
+      const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = latestPublishedVersion();
+      if (!latest) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本，无法预演');
+      if (latest.id !== ver.id) {
+        throw new ApiError(409, 'VERSION_STALE',
+          `页面基于的第 ${ver.version_no} 版已不是当前执行版（当前为第 ${latest.version_no} 版），请刷新后重新预演`,
+          { currentVersionId: latest.id, currentVersionNo: latest.version_no });
+      }
+
+      const { cues, deps, regMap } = versionInputs(ver.id);
+      const cueById = new Map(cues.map((c) => [c.id, c]));
+      const readAt = new Date().toLocaleString('sv-SE');
+
+      // rows 必须与当前版本全部提示项一一对应；任一登记行版本变化整体拒绝
+      const stale = [];
+      if (rows.length !== cues.length) {
+        stale.push({
+          cueRef: null, code: null,
+          reason: `提交的登记行数量（${rows.length}）与当前执行版提示项数量（${cues.length}）不一致，请刷新后重新预演`,
+        });
+      }
+      for (const r of rows) {
+        const cue = cueById.get(r.cueRef);
+        if (!cue) {
+          stale.push({
+            cueRef: r.cueRef, code: null,
+            reason: `提示项引用 ${r.cueRef} 不在当前执行版中（执行版可能已变化），请刷新后重新预演`,
+          });
+          continue;
+        }
+        const reg = regMap.get(r.cueRef);
+        if (!reg) {
+          stale.push({ cueRef: r.cueRef, code: cue.code, reason: `「${cue.code}」登记行缺失，请刷新后重新预演` });
+          continue;
+        }
+        if (reg.rowVer !== r.rowVersion) {
+          stale.push({
+            cueRef: r.cueRef, code: cue.code,
+            previewRowVersion: r.rowVersion,
+            currentRowVersion: reg.rowVer,
+            reason: `「${cue.code}」登记行版本已变化（提交基于 v${r.rowVersion}，当前 v${reg.rowVer}，可能被岗位登记、舞监更正或跳过更新），请刷新后重新预演`,
+          });
+        }
+      }
+      if (stale.length) {
+        throw new ApiError(409, 'WHATIF_STALE',
+          `执行版或登记行已变化（${stale.length} 项），本次预演已整体拒绝，请刷新后重新预演`,
+          { items: stale, currentVersionId: latest.id, currentVersionNo: latest.version_no });
+      }
+
+      // 以同一快照为基线一次性套用全部假设并重算
+      const sim = simulateWhatIf(cues, deps, regMap, assumptionsParsed);
+      if (sim.orderProblem) {
+        throw new ApiError(409, 'WHATIF_ORDER_PROBLEM', `已发布数据检测到依赖环，无法预演：${sim.orderProblem}`);
+      }
+      if (sim.errors?.length) {
+        throw new ApiError(400, 'WHATIF_INVALID',
+          `${sim.errors.length} 项假设不成立，本次预演已整体拒绝（未更改任何登记、计划与更正历史）`,
+          { items: sim.errors });
+      }
+      return { ver, sim, readAt };
+    })();
+
+    const { ver, sim, readAt } = result;
+    res.json({
+      versionId: ver.id,
+      versionNo: ver.version_no,
+      isLatest: true,
+      readAt,
+      readOnly: true,
+      assumptions: assumptionsParsed.map((a) => ({
+        cueRef: a.cueRef,
+        code: (db.prepare('SELECT code FROM published_cues WHERE version_id=? AND cue_ref=?').get(ver.id, a.cueRef) || {}).code || null,
+        estimatedEndText: a.estimatedEndText,
+      })),
+      cues: sim.cues,
+      baselineConflicts: sim.baseline.conflicts,
+      scenarioConflicts: sim.scenario.conflicts,
+      conflictsAdded: sim.conflictsAdded,
+      conflictsRemoved: sim.conflictsRemoved,
+      conflictsKept: sim.conflictsKept,
+      summary: sim.summary,
+    });
+  } catch (e) { next(e); }
+});
 
 // ---------- 静态页面与错误处理 ----------
 

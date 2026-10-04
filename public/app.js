@@ -12,6 +12,7 @@ const state = {
   handoverLoading: false,
   deputies: null,
   skipPreview: null,
+  whatifInputs: new Map(),
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -503,6 +504,7 @@ function renderLive() {
     $('#live-conflicts').innerHTML = '';
     $('#live-deputy-banner').innerHTML = '';
     $('#deputy-panel').hidden = true;
+    $('#whatif-panel').hidden = true;
     $('#live-tbody').innerHTML = '';
     return;
   }
@@ -519,10 +521,11 @@ function renderLive() {
   // 现场页面按最新授权显示可操作项：优先用服务器下发的有效岗位（含代班），兼容旧响应
   const myPositions = Array.isArray(v.myPositions) ? v.myPositions : (isOp && myPos ? [myPos] : []);
   const canReg = isOp && v.isLatest;
-  $('#live-col-reg').textContent = isSM ? '跳过 / 更正' : '岗位登记';
+  $('#live-col-reg').textContent = isSM ? '跳过 / 更正 / 预演' : '岗位登记';
   $('#sm-correct-hint').hidden = !isSM;
   const skipHint = $('#sm-skip-hint');
   if (skipHint) skipHint.hidden = !isSM;
+  $('#whatif-panel').hidden = !(isSM && v.isLatest);
 
   const activeDepByPos = new Map((v.deputies || []).filter((d) => d.active).map((d) => [d.position, d]));
 
@@ -729,13 +732,18 @@ function renderCorrectionCell(c, v, scope) {
   const skipBtn = (v.isLatest && scope === 'live' && c.status !== 'SKIPPED')
     ? `<button class="warn tiny" data-act="open-skip-preview" data-cue="${c.id}">跳过链…</button>`
     : '';
+  // 顺延预演仅对未完成、未跳过项开放（已开始项可用；结果不会写入任何登记）
+  const whatifBtn = (v.isLatest && scope === 'live' && c.status === 'PENDING')
+    || (v.isLatest && scope === 'live' && c.status === 'RUNNING')
+    ? `<button class="ghost tiny" data-act="open-whatif" data-cue="${c.id}">顺延预演</button>`
+    : '';
   const corrBtn = v.isLatest && scope === 'live'
     ? `<button class="danger tiny" data-act="open-correct" data-scope="${scope}" data-cue="${c.id}">更正</button>`
     : scope === 'live' ? '<span class="muted">归档不可更正</span>' : '';
   const histBtn = c.corrections?.length
     ? `<button class="ghost tiny" data-act="open-history" data-scope="${scope}" data-cue="${c.id}">更正记录(${c.corrections.length})</button>`
     : '';
-  return `<div class="corr-actions">${skipBtn}${corrBtn}${histBtn}</div>`;
+  return `<div class="corr-actions">${skipBtn}${whatifBtn}${corrBtn}${histBtn}</div>`;
 }
 
 function openModal(title, html) {
@@ -784,11 +792,15 @@ function renderHistoryHtml(cue, v) {
 }
 
 $('#live-tbody').addEventListener('click', (ev) => {
-  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip-preview"], button[data-act="open-skip-view"], button[data-act="open-explain"]');
+  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip-preview"], button[data-act="open-skip-view"], button[data-act="open-explain"], button[data-act="open-whatif"]');
   if (!corrBtn) return;
   const cueId = Number(corrBtn.dataset.cue);
   if (corrBtn.dataset.act === 'open-explain') {
     openExplain(cueId, 'live');
+    return;
+  }
+  if (corrBtn.dataset.act === 'open-whatif') {
+    openWhatIf([cueId]);
     return;
   }
   const { v, cue } = findCueInContext('live', cueId);
@@ -1020,6 +1032,190 @@ function renderOtherPreds(list) {
   return `<div class="muted">其他前置（结束时刻早于最终约束，未决定该开始）：${list.map((p) =>
     `${esc(p.code)} 结束 ${esc(p.endText)}`).join('；')}</div>`;
 }
+
+// ---------- 舞监：现场顺延预演（只读假设推演） ----------
+
+function whatifEligible(v) {
+  // 仅未完成、未跳过提示项可填写假设（未开始 / 已开始）
+  return (v?.cues || []).filter((c) => c.status === 'PENDING' || c.status === 'RUNNING');
+}
+
+function deltaHtml(delta) {
+  if (delta > 0) return `<span class="wi-delay">+${delta} 分</span>`;
+  if (delta < 0) return `<span class="wi-advance">${delta} 分</span>`;
+  return '<span class="muted">无变化</span>';
+}
+
+function openWhatIf(prefillIds = []) {
+  const v = state.live;
+  if (!v) return;
+  const eligible = whatifEligible(v);
+  if (!eligible.length) {
+    alertBar('error', '当前执行版没有未完成且未跳过的提示项，无法填写假设。');
+    return;
+  }
+  const preSet = new Set(prefillIds);
+  const rows = eligible.map((c) => {
+    const saved = state.whatifInputs.get(c.id);
+    const val = saved ?? (preSet.has(c.id) ? (c.estimatedEndText ?? c.schedEndText) : '');
+    const cur = c.status === 'RUNNING'
+      ? `实际开始 ${esc(c.actualStartText)}｜预计结束 ${esc(c.estimatedEndText ?? '—')}`
+      : `预计结束 ${esc(c.estimatedEndText ?? '—')}`;
+    return `<tr class="${preSet.has(c.id) ? 'wi-prefill' : ''}">
+      <td><strong>${esc(c.code)}</strong></td>
+      <td>${esc(c.title)}</td>
+      <td>${esc(c.position)}</td>
+      <td>${statusBadge(c.status)}</td>
+      <td class="mono">${esc(c.schedStartText)} - ${esc(c.schedEndText)}</td>
+      <td class="muted">${cur}<div>行版本 v${c.rowVer}</div></td>
+      <td><input type="time" data-wi-cue="${c.id}" class="wi-time" value="${esc(val ?? '')}" />
+        <div class="muted">假设预计结束（留空=不假设）</div></td>
+    </tr>`;
+  }).join('');
+  openModal('现场顺延预演：填写假设', `
+    <form id="whatif-form">
+      <div class="muted">
+        第 ${v.versionNo} 版（当前执行版）。为一项或多项<strong>未完成、未跳过</strong>提示项填写假设预计结束（HH:MM）；
+        已开始项不得早于实际开始，未开始项不得早于预演算出的开始（含同批其他假设的联动结果）。<br>
+        提交时携带当前页面所见版本与<strong>全部提示项登记行版本</strong>：执行版或任一登记行已变化时整体拒绝并提示刷新。
+        预演<strong>只读</strong>，不更改登记、计划、跳过状态与更正历史。
+      </div>
+      <div class="table-wrap whatif-form-wrap">
+        <table>
+          <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>状态</th><th>当前待执行时段</th><th>现有登记 / 行版本</th><th>假设预计结束</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div id="whatif-err" class="error-text" hidden></div>
+      <div class="form-actions">
+        <button type="submit" class="primary">同时套用全部假设并重算</button>
+        <button type="button" class="ghost" id="whatif-cancel">取消</button>
+      </div>
+    </form>`);
+  $('#whatif-cancel').addEventListener('click', closeModal);
+  const first = prefillIds.length ? $(`.wi-time[data-wi-cue="${prefillIds[0]}"]`) : $('.wi-time');
+  if (first && first.value) first.focus();
+}
+
+$('#whatif-open')?.addEventListener('click', () => openWhatIf([]));
+
+function renderWhatIfResult(data) {
+  const s = data.summary;
+  const head = `
+    <div class="muted">
+      第 ${data.versionNo} 版（当前执行版）｜快照读取于 ${esc(data.readAt)}｜只读预演，未写入任何数据<br>
+      本次假设 ${s.assumedCount} 项；逐项时段变化 ${s.changedCount} 项；
+      同岗位冲突：基线 ${s.baselineConflictCount} 项 → 预演 ${s.scenarioConflictCount} 项
+      （新增 ${s.addedCount}、消失 ${s.removedCount}、仍存在 ${s.keptCount}）
+    </div>
+    <div class="wi-assumptions">套用假设：${data.assumptions.map((a) =>
+      `<span class="wi-assumed-tag">${esc(a.code)} ≤ <strong class="mono">${esc(a.estimatedEndText)}</strong></span>`).join(' ')}</div>`;
+
+  const added = data.conflictsAdded?.length
+    ? `<div class="conflict-banner"><strong>🔴 新增同岗位冲突 ${data.conflictsAdded.length} 项：</strong><ul>${
+        data.conflictsAdded.map((c) => `<li>${esc(c.message)}</li>`).join('')}</ul></div>` : '';
+  const removed = data.conflictsRemoved?.length
+    ? `<div class="wi-removed-box"><strong>🟢 消失的冲突 ${data.conflictsRemoved.length} 项：</strong><ul>${
+        data.conflictsRemoved.map((c) => `<li>${esc(c.message)}</li>`).join('')}</ul></div>` : '';
+  const kept = data.conflictsKept?.length
+    ? `<div class="wi-kept-box"><strong>🟠 仍存在的冲突 ${data.conflictsKept.length} 项：</strong><ul>${
+        data.conflictsKept.map((k) => k.baseline.message === k.scenario.message
+          ? `<li>${esc(k.scenario.message)}</li>`
+          : `<li>变更前：${esc(k.baseline.message)}<br>变更后：${esc(k.scenario.message)}</li>`).join('')}</ul></div>`
+    : '';
+  const noConflict = (!s.addedCount && !s.removedCount && !s.keptCount)
+    ? '<div class="val-ok">✅ 预演前后均无同岗位冲突。</div>' : '';
+
+  const trs = data.cues.map((c) => {
+    const skipped = c.status === 'SKIPPED';
+    const base = skipped ? '—（跳过）' : `${esc(c.baselineStartText)} - ${esc(c.baselineEndText)}`;
+    const scen = skipped
+      ? '—（跳过）'
+      : `${esc(c.scenarioStartText)} - ${esc(c.scenarioEndText)}${c.delayed ? '<div class="delayed">晚于原计划</div>' : ''}`;
+    return `<tr class="${c.assumed ? 'wi-assumed-row' : ''} ${skipped ? 'skipped-row' : ''} ${c.changed ? 'wi-changed-row' : ''}">
+      <td><strong>${esc(c.code)}</strong>${c.assumed ? '<div class="wi-assumed-flag">假设项</div>' : ''}</td>
+      <td>${esc(c.title)}</td>
+      <td>${esc(c.position)}</td>
+      <td>${esc(c.statusLabel)}</td>
+      <td class="mono">${esc(c.plannedStartText)} - ${esc(c.plannedEndText)}</td>
+      <td class="mono">${base}</td>
+      <td class="mono">${scen}</td>
+      <td class="mono">${skipped ? '—' : deltaHtml(c.startDeltaMinutes)}</td>
+      <td class="mono">${skipped ? '—' : deltaHtml(c.endDeltaMinutes)}</td>
+    </tr>`;
+  }).join('');
+
+  openModal(`现场顺延预演结果：第 ${data.versionNo} 版`, `
+    ${head}
+    ${added}${removed}${kept}${noConflict || ''}
+    <div class="table-wrap whatif-result-wrap">
+      <table>
+        <thead><tr>
+          <th>编号</th><th>说明</th><th>岗位</th><th>状态</th><th>原计划时段</th>
+          <th>变更前（基线）待执行</th><th>变更后（预演）待执行</th><th>开始差</th><th>结束差</th>
+        </tr></thead>
+        <tbody>${trs}</tbody>
+      </table>
+    </div>
+    <div class="muted">
+      差异以同一次读取的当前版本与登记快照为基线计算；已跳过项无待执行时段、不参与冲突。
+      本预演<strong>不更改登记、已发布计划、跳过状态与更正历史</strong>；如需落实，请由岗位按既有流程登记或由舞监更正。
+    </div>
+    <div class="form-actions">
+      <button type="button" class="primary" id="whatif-edit">调整假设重新预演</button>
+      <button type="button" class="ghost" id="whatif-close">关闭</button>
+    </div>`);
+  $('#whatif-close').addEventListener('click', closeModal);
+  $('#whatif-edit').addEventListener('click', () => openWhatIf([]));
+}
+
+$('#modal-overlay').addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#whatif-form');
+  if (!form) return;
+  ev.preventDefault();
+  const v = state.live;
+  if (!v) { closeModal(); return; }
+  const errBox = $('#whatif-err');
+  errBox.hidden = true;
+  errBox.textContent = '';
+
+  const assumptions = [];
+  const inputs = $$('.wi-time', form);
+  for (const inp of inputs) {
+    const cueRef = Number(inp.dataset.wiCue);
+    const val = inp.value?.trim() || '';
+    state.whatifInputs.set(cueRef, val);
+    if (val) assumptions.push({ cueRef, estimatedEndText: val });
+  }
+  if (!assumptions.length) {
+    errBox.textContent = '请至少为一项提示项填写假设预计结束（不需要假设的行保持留空）。';
+    errBox.hidden = false;
+    return;
+  }
+  // 请求携带所见版本及全部提示项登记行版本；服务端在同一事务内核验，不返回混合时点结果
+  const payload = {
+    versionId: v.id,
+    rows: v.cues.map((c) => ({ cueRef: c.id, rowVersion: c.rowVer })),
+    assumptions,
+  };
+  const btn = form.querySelector('button[type="submit"]');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/live/whatif', payload);
+    renderWhatIfResult(data);
+  } catch (e) {
+    btn.disabled = false;
+    if (e.status === 409) {
+      // 执行版或登记行变化：整体提示刷新，不使用旧页面继续推演
+      closeModal();
+      alertBar('error', errorToHtml(e), 10000);
+      loadLive().then(renderLive).catch(() => {});
+    } else {
+      errBox.innerHTML = errorToHtml(e);
+      errBox.hidden = false;
+    }
+  }
+});
 
 function openCorrectForm(cue, v) {
   const options = CORR_FIELDS.map((f) =>

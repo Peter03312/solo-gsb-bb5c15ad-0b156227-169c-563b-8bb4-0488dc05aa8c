@@ -160,3 +160,21 @@ tr.skipped-row td strong { color: #5b3a9a; }
 .src-tag.src-estimated { background: #fff3df; color: #9a6200; }
 .src-tag.src-duration { background: #e8eefc; color: #2f56c4; }
 .explain-skipped { margin: 6px 0; font-size: 12px; color: #5b3a9a; }
+
+/* 现场顺延预演 */
+.whatif-form-wrap td, .whatif-form-wrap th { font-size: 12px; vertical-align: top; white-space: normal; }
+.whatif-form-wrap .wi-time { width: 100px; }
+tr.wi-prefill td { background: #eef4ff; }
+.whatif-result-wrap td, .whatif-result-wrap th { font-size: 12px; vertical-align: top; }
+tr.wi-changed-row td { background: #fff8ec; }
+tr.wi-changed-row:hover td { background: #fef3dd; }
+tr.wi-assumed-row td { border-left: 3px solid #2f6fed; }
+.wi-assumed-flag { display: inline-block; margin-top: 2px; font-size: 11px; color: #fff; background: #2f6fed; border-radius: 6px; padding: 0 6px; }
+.wi-delay { color: #c0392b; font-weight: 700; }
+.wi-advance { color: #1d7a43; font-weight: 700; }
+.wi-assumptions { margin: 8px 0; font-size: 13px; }
+.wi-assumed-tag { display: inline-block; background: #e8eefc; color: #2f56c4; border-radius: 6px; padding: 1px 8px; margin: 2px 4px 2px 0; font-size: 12px; }
+.wi-removed-box { background: #e9f8ef; border: 1px solid #8fd3aa; color: #1d6b43; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }
+.wi-removed-box ul { margin: 6px 0 0; padding-left: 18px; }
+.wi-kept-box { background: #fdf3e7; border: 1px solid #f0cf9f; color: #8a5a00; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }
+.wi-kept-box ul { margin: 6px 0 0; padding-left: 18px; }

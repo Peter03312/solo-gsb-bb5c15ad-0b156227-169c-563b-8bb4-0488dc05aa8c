@@ -258,6 +258,8 @@ function computeLive(publishedCues, deps, regMap) {
             && (a.status !== 'DONE' || b.status !== 'DONE')) {
           conflicts.push({
             position,
+            aRef: a.id,
+            bRef: b.id,
             codes: [a.code, b.code],
             message: `岗位「${position}」执行时段冲突：「${a.code}」(${minToTime(a.schedStart)}-${minToTime(a.schedEnd)}) 与「${b.code}」(${minToTime(b.schedStart)}-${minToTime(b.schedEnd)})`,
           });
@@ -423,4 +425,144 @@ function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons) {
   };
 }
 
-module.exports = { timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule };
+const WHATIF_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: '已完成', SKIPPED: '已跳过' };
+
+/**
+ * 现场顺延预演（只读）：以同一次读取的已发布计划 + 登记快照为基线，
+ * 将全部假设预计结束一次性套用后按现有前置与跳过规则重算，
+ * 给出逐项「待执行开始 / 结束」差异与同岗位冲突的新增 / 消失 / 仍存在对照。
+ *
+ * 入参与 computeLive 相同，另含：
+ *   assumptions: [{cueRef, estimatedEnd}]（已解析为分钟数；允许把未开始项既有预计结束改为更早，
+ *                只要不早于预演出的开始；重算不早于原计划等规则完全沿用 computeLive）
+ *
+ * 返回：
+ *   { errors: [{cueRef, code, reason}] }  存在无效假设时调用方应整体拒绝（不产出任何结果）
+ *   或 { baseline, scenario, cues, conflictsAdded, conflictsRemoved, conflictsKept, summary }
+ */
+function simulateWhatIf(publishedCues, deps, regMap, assumptions) {
+  const baseline = computeLive(publishedCues, deps, regMap);
+  if (baseline.orderProblem) return { orderProblem: baseline.orderProblem };
+
+  // 预演登记：一次性套用全部假设（只改预计结束；不动实际开始/完成、跳过状态与计划）
+  const whatReg = new Map();
+  for (const [ref, r] of regMap.entries()) whatReg.set(ref, { ...r });
+  for (const a of assumptions) {
+    const r = whatReg.get(a.cueRef);
+    if (r) whatReg.set(a.cueRef, { ...r, estimatedEnd: a.estimatedEnd });
+  }
+
+  // 全部假设同时生效后的重算结果
+  const scenario = computeLive(publishedCues, deps, whatReg);
+
+  const baseByRef = new Map(baseline.cues.map((c) => [c.id, c]));
+  const scenByRef = new Map(scenario.cues.map((c) => [c.id, c]));
+
+  // 无效假设整体拒绝：已完成 / 已跳过不可预演；已开始项不得早于实际开始；
+  // 未开始项不得早于预演（全部假设套用后）算出的开始。
+  const errors = [];
+  for (const a of assumptions) {
+    const base = baseByRef.get(a.cueRef);
+    const scen = scenByRef.get(a.cueRef);
+    if (!base || !scen) {
+      errors.push({ cueRef: a.cueRef, code: base?.code || null, reason: `提示项引用 ${a.cueRef} 不存在` });
+      continue;
+    }
+    if (base.status === 'DONE') {
+      errors.push({ cueRef: a.cueRef, code: base.code, reason: `「${base.code}」已完成，不能再填写假设预计结束` });
+      continue;
+    }
+    if (base.status === 'SKIPPED') {
+      errors.push({ cueRef: a.cueRef, code: base.code, reason: `「${base.code}」已跳过，不能填写假设预计结束` });
+      continue;
+    }
+    if (base.status === 'RUNNING') {
+      if (a.estimatedEnd < base.actualStart) {
+        errors.push({
+          cueRef: a.cueRef, code: base.code,
+          reason: `「${base.code}」已开始：假设预计结束 ${minToTime(a.estimatedEnd)} 早于实际开始 ${minToTime(base.actualStart)}`,
+        });
+      }
+      continue;
+    }
+    // PENDING：下界是「全部假设套用后」自身的重算开始（不能用基线值，否则同批前置假设无法生效）
+    if (a.estimatedEnd < scen.schedStart) {
+      errors.push({
+        cueRef: a.cueRef, code: base.code,
+        reason: `「${base.code}」未开始：假设预计结束 ${minToTime(a.estimatedEnd)} 早于预演算出的开始 ${minToTime(scen.schedStart)}`,
+      });
+    }
+  }
+  if (errors.length) return { errors };
+
+  // 冲突以「岗位 + 双方提示项引用」为稳定键：逐项对照消息（时刻随假设变化），区分新增 / 消失 / 仍存在
+  const conflictKey = (c) => `${c.position}|${[c.aRef, c.bRef].sort((x, y) => x - y).join('#')}`;
+  const baseConflicts = new Map(baseline.conflicts.map((c) => [conflictKey(c), c]));
+  const scenConflicts = new Map(scenario.conflicts.map((c) => [conflictKey(c), c]));
+  const conflictsAdded = [];
+  const conflictsRemoved = [];
+  const conflictsKept = [];
+  for (const [key, sc] of scenConflicts) {
+    const bc = baseConflicts.get(key);
+    if (!bc) conflictsAdded.push(sc);
+    else conflictsKept.push({ baseline: bc, scenario: sc });
+  }
+  for (const [key, bc] of baseConflicts) {
+    if (!scenConflicts.has(key)) conflictsRemoved.push(bc);
+  }
+
+  const assumedSet = new Set(assumptions.map((a) => a.cueRef));
+  const cues = scenario.cues
+    .slice()
+    .sort((a, b) => a.plannedStart - b.plannedStart || a.id - b.id)
+    .map((c) => {
+      const b = baseByRef.get(c.id);
+      const isActive = c.status !== 'SKIPPED';
+      const startDelta = isActive ? c.schedStart - b.schedStart : 0;
+      const endDelta = isActive ? c.schedEnd - b.schedEnd : 0;
+      return {
+        cueRef: c.id,
+        code: c.code,
+        title: c.title,
+        position: c.position,
+        status: c.status,
+        statusLabel: WHATIF_STATUS_LABEL[c.status] || c.status,
+        assumed: assumedSet.has(c.id),
+        plannedStart: c.plannedStart,
+        plannedStartText: minToTime(c.plannedStart),
+        plannedEndText: minToTime(c.plannedStart + c.duration),
+        baselineStartText: isActive ? minToTime(b.schedStart) : null,
+        baselineEndText: isActive ? minToTime(b.schedEnd) : null,
+        scenarioStartText: isActive ? minToTime(c.schedStart) : null,
+        scenarioEndText: isActive ? minToTime(c.schedEnd) : null,
+        startDeltaMinutes: startDelta,
+        endDeltaMinutes: endDelta,
+        changed: isActive && (startDelta !== 0 || endDelta !== 0),
+        delayed: c.delayed === true,
+      };
+    });
+
+  const changedCount = cues.filter((c) => c.changed).length;
+  return {
+    baseline,
+    scenario,
+    cues,
+    conflictsAdded,
+    conflictsRemoved,
+    conflictsKept,
+    summary: {
+      cueCount: cues.length,
+      assumedCount: assumptions.length,
+      changedCount,
+      baselineConflictCount: baseline.conflicts.length,
+      scenarioConflictCount: scenario.conflicts.length,
+      addedCount: conflictsAdded.length,
+      removedCount: conflictsRemoved.length,
+      keptCount: conflictsKept.length,
+    },
+  };
+}
+
+module.exports = {
+  timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule, simulateWhatIf,
+};
