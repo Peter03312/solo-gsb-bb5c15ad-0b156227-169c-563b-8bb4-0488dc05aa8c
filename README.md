@@ -135,6 +135,18 @@ npm start
 
 页面上：跳过行以紫色「已跳过」徽标与置灰底色展示，重算时段与实际/预计时间列显示「—」，实际开始列附跳过原因标签；舞监可点「跳过原因」回看详情；版本列表新增「已跳过」计数；执行账号的现场页对跳过项只读且无登记按钮。
 
+#### 现场顺延预演（本轮新增，只读）
+
+现场发生顺延时，舞监在「现场联排」页点右上角「**现场顺延预演…**」，对**当前执行版**的一项或多项**未完成、未跳过**提示项填写**假设预计结束时间**，在不落库的前提下查看「如果这些项按假设结束」的整体后果：
+
+- **同一基线、同时套用**：预演以**同一次读取**的当前执行版冻结计划与**全部提示项登记行**为基线，把全部假设**一次性同时**写入内存中的临时登记，再按**现有前置约束与跳过规则**整体重算（`computeLive` 同源），不是逐项串行试算；
+- **下界校验**：**已开始（RUNNING）项**的假设不得早于其**实际开始**；**未开始（PENDING）项**的假设不得早于**预演算出的开始**（含其他假设经前置链带来的顺延）；恰相等允许；
+- **明确拒绝**：无效时间（非 `HH:MM`）、同一提示项重复假设、**已完成（DONE）**或**已跳过（SKIPPED）**项、提示项不属于当前版本，均在响应中逐项列出并**整体拒绝**（HTTP 400 `BAD_INPUT`），不返回任何预演结果；
+- **所见版本 + 全量行版本**：请求必须携带 `versionId` 与**全部提示项**登记行的 `rowVersion`（`expectedRows`）。执行版已归档（409 `VERSION_STALE`），或**任一行版本变化 / 清单缺项 / 多项**（409 `SNAPSHOT_STALE`，响应附全部当前行版本 `currentRows`）时**整体提示刷新，不返回混合时点结果**；
+- **结果对照**：响应给出变更前（`baseline`）与变更后（`scenario`）的每个待执行项开始/结束/顺延标记（`cueDiffs` 逐项差异，含分钟级增减），以及同岗位冲突的**新增 `added` / 消失 `removed` / 保留 `kept`** 三类对照；
+- **只读保证**：预演**不更改**登记、已发布计划、跳过留痕、更正历史（全程只读事务，无任何写入）；可反复修改假设重新预演；
+- 页面弹窗中：已完成 / 已跳过项不出现在填写表；提交后顶部展示假设清单、新增/消失冲突两栏（保留冲突可折叠查看时段变化）与逐项差异表（假设项黄色底标注）；**仅舞监**可用；历史版本、执行账号均无入口。
+
 #### 排期来源解释（本轮新增）
 
 现场发现某提示项顺延时，舞监与执行岗位都可在「现场联排」页（当前执行版）或「发布版本」回看页（历史版本）点该行的「**来源**」按钮，查看其**排期开始时刻如何形成**：
@@ -170,6 +182,7 @@ npm start
 - 现场登记按「提示项行版本号」校验：两位岗位同时操作同一提示项时，先提交者成功，后提交者收到 409 明确报错并刷新；
 - **舞监更正与岗位登记共用同一条登记行版本号**：任一方更新后行版本 +1，另一方（或持旧页面重复提交）会收到 409 拒绝并被要求刷新，确保更正不能覆盖新登记、新登记也不能覆盖更正。
 - **依赖链跳过同样以链中每项的登记行版本号为乐观锁**：确认必须回传预览所见的每个 `rowVersion`；预览后任一项被登记或更正（行版本推进），整次跳过 409 拒绝；跳过成功后新跳过项行版本 +1（已跳过项不重复更新）。
+- **现场顺延预演以执行版 + 全量登记行版本为只读快照**：请求携带 `versionId` 与当前版本**全部**提示项的 `rowVersion`；执行版归档返回 409 `VERSION_STALE`，任一行变化 / 清单缺项 / 多项返回 409 `SNAPSHOT_STALE`（附当前全量行版本），客户端整体刷新后重新填写，不接受混合时点结果。预演本身不推进任何行版本。
 
 ## 五、配置项（环境变量）
 
@@ -227,6 +240,7 @@ SESSION_SECRET=your-long-random-secret
 | POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史；已跳过项 409 `CUE_SKIPPED`） |
 | GET | `/api/live/skips/preview` | 舞监 | **依赖链跳过影响预览**（仅当前执行版）：根项及沿前置可达的全部后继、各项行版本、阻断项与已跳过原因 |
 | POST | `/api/live/skips` | 舞监 | **确认跳过整条依赖链**（非空原因 + 预览所见行版本；事务内核验，阻断/版本变化整体拒绝；首跳清除预计结束并留痕，已跳过项不重复留痕） |
+| POST | `/api/live/delay-preview` | 舞监 | **现场顺延预演（只读）**：携带所见版本与全部登记行版本，对一项或多项未完成/未跳过项同时套用假设预计结束后重算，返回逐项差异与新增/消失冲突；不写任何数据 |
 | GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`）与历史回看（每行含更正历史 `corrections` 与跳过留痕 `skip`） |
 | GET | `/api/versions/:id/cues/:cueRef/explain` | 已登录 | **排期开始来源解释**（当前执行版与历史版本通用，只读）：以原计划开始为基线，达到最终最大约束时刻的直接前置全部列出并逐层追溯来源；目标已开始/已完成/已跳过返回明确说明 |
 
@@ -639,5 +653,212 @@ HTTP 200
 
 - 解释与 `GET /api/live` / `GET /api/versions/:id` 的重算结果**同源**（同一 `computeLive` 计算）：解释中目标项的 `schedStartText` 与现场页「重算开始」逐项一致；
 - 登记、舞监更正或依赖链跳过后，重新打开「来源」弹窗（或刷新页面）即可看到新解释；历史版本按归档状态只读回看，不随新登记变化之外的任何写操作影响（解释接口本身不写入任何数据）。
+
+## 十二、现场顺延预演 API 调用示例（本轮新增，只读）
+
+以本地默认端口 3000、舞监账号为例（`curl -c/-b` 复用会话 Cookie）。仅**舞监**、仅**当前执行版**可调用；接口为 **POST**（携带假设清单），全程只读、不写任何数据。假设当前执行版为第 2 版，提示项：`L1 → S1 → L2 → L3`、`L1 → P1`、`S1 → S2`，另有独立灯光项 `L5`（19:30 开始，5 分钟）。
+
+### 1. 从现场负载取所见行版本，提交假设
+
+`GET /api/live` 每个 `cues[]` 的 `id`（即 cueRef）与 `rowVer` 即预演请求必须回传的 `expectedRows`（**全部提示项，不只是假设项**）：
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"sm","password":"sm12345"}'
+
+# 对已开始的 S1（实际开始 19:18）假设预计结束 19:22
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/delay-preview \
+  -H 'Content-Type: application/json' -d '{
+    "versionId": 2,
+    "expectedRows": [
+      {"cueRef": 1, "rowVersion": 1},
+      {"cueRef": 2, "rowVersion": 2},
+      {"cueRef": 3, "rowVersion": 3},
+      {"cueRef": 4, "rowVersion": 1},
+      {"cueRef": 5, "rowVersion": 2},
+      {"cueRef": 6, "rowVersion": 1},
+      {"cueRef": 7, "rowVersion": 1}
+    ],
+    "assumptions": [
+      {"cueRef": 2, "estimatedEndText": "19:22"}
+    ]
+  }'
+```
+
+可一次提交**多项假设**（同时套用、一次重算），例如：
+
+```json
+"assumptions": [
+  {"cueRef": 1, "estimatedEndText": "19:10"},
+  {"cueRef": 2, "estimatedEndText": "19:20"}
+]
+```
+
+成功响应（节选）：
+
+```json
+{
+  "readOnly": true,
+  "versionId": 2, "versionNo": 2, "isLatest": true,
+  "snapshotAt": "2026-10-04 21:30:12",
+  "assumptions": [
+    { "cueRef": 2, "code": "S1", "position": "音响", "status": "RUNNING",
+      "actualStartText": "19:18", "scenarioStartText": "19:18", "assumedEndText": "19:22" }
+  ],
+  "baseline": {
+    "cues": [
+      { "cueRef": 6, "code": "L3", "position": "灯光", "status": "PENDING",
+        "plannedStartText": "19:20", "schedStartText": "19:29", "schedEndText": "19:33",
+        "delayed": true, "actualStartText": null }
+    ],
+    "conflicts": [
+      { "position": "灯光", "codes": ["L3", "L5"],
+        "message": "岗位「灯光」执行时段冲突：「L3」(19:29-19:33) 与「L5」(19:30-19:35)" }
+    ]
+  },
+  "scenario": {
+    "cues": [
+      { "cueRef": 6, "code": "L3", "status": "PENDING",
+        "schedStartText": "19:30", "schedEndText": "19:34", "delayed": true,
+        "assumptionApplied": false }
+    ],
+    "conflicts": [
+      { "position": "灯光", "codes": ["L3", "L5"],
+        "message": "岗位「灯光」执行时段冲突：「L3」(19:30-19:34) 与「L5」(19:30-19:35)" }
+    ]
+  },
+  "cueDiffs": [
+    { "cueRef": 6, "code": "L3", "position": "灯光", "status": "PENDING",
+      "changed": true, "assumption": false,
+      "delayedBefore": true, "delayedAfter": true,
+      "fields": [
+        { "field": "schedStart", "label": "待执行开始",
+          "beforeText": "19:29", "afterText": "19:30", "deltaMinutes": 1 },
+        { "field": "schedEnd", "label": "待执行结束",
+          "beforeText": "19:33", "afterText": "19:34", "deltaMinutes": 1 }
+      ] }
+  ],
+  "changedCueRefs": [2, 4, 5, 6],
+  "conflictDiff": {
+    "beforeCount": 1, "afterCount": 1,
+    "added": [],
+    "removed": [],
+    "kept": [
+      { "position": "灯光", "codes": ["L3", "L5"],
+        "beforeMessage": "岗位「灯光」执行时段冲突：「L3」(19:29-19:33) 与「L5」(19:30-19:35)",
+        "afterMessage":  "岗位「灯光」执行时段冲突：「L3」(19:30-19:34) 与「L5」(19:30-19:35)" }
+    ]
+  },
+  "summary": { "assumptionCount": 1, "cuesChanged": 4,
+    "conflictsAdded": 0, "conflictsRemoved": 0, "conflictsKept": 1,
+    "conflictsBefore": 1, "conflictsAfter": 1 },
+  "summaryText": "已同时套用 1 项假设重算：待执行时段变化 4 项；同岗位冲突由 1 项变为 1 项（新增 0、消失 0）。预演为只读，未改动登记、计划与更正历史。"
+}
+```
+
+字段要点：
+
+- `baseline` / `scenario`：变更前 / 变更后的完整重算结果（精简提示项数组 + 同岗位冲突数组），均来自同一 `computeLive`；
+- `cueDiffs[].fields`：逐项差异，`field` 取值 `schedStart`（待执行开始）、`schedEnd`（待执行结束）、`delayed`（顺延标记）、`estimatedEnd`（仅假设项，假设预计结束），带前后文本与 `deltaMinutes`；
+- `conflictDiff`：冲突按 **岗位 + 双方编号** 身份对照——`added` 新增、`removed` 消失（内容为变更前消息）、`kept` 保留（同时给出变更前/后消息，时段可能已变）；
+- 已跳过项在两种结果中均为 `status="SKIPPED"`、`schedStartText/schedEndText` 为 `null`，不参与冲突；
+- 成功响应**不包含任何写操作**：重新 `GET /api/live` 得到的仍是预演前结果。
+
+### 2. 新增 / 消失冲突的典型结果
+
+假设把未开始的 `S1` 预计结束假设为 `19:22`（其原推算结束 19:08），使 `L3` 顺延到 19:30 与独立灯光项 `L5` 重叠时：
+
+```json
+"conflictDiff": {
+  "beforeCount": 0, "afterCount": 1,
+  "added": [
+    { "position": "灯光", "codes": ["L3", "L5"],
+      "message": "岗位「灯光」执行时段冲突：「L3」(19:30-19:34) 与「L5」(19:30-19:35)" }
+  ],
+  "removed": [], "kept": []
+}
+```
+
+基线已存在该冲突（如 `S1` 实际开始 19:18 按时长推算 `L3` 19:29-19:33 与 `L5` 冲突），而对已开始的 `S1` 假设预计结束 `19:18`（恰等于实际开始，合法）后冲突消失：
+
+```json
+"conflictDiff": {
+  "beforeCount": 1, "afterCount": 0, "added": [],
+  "removed": [
+    { "position": "灯光", "codes": ["L3", "L5"],
+      "message": "岗位「灯光」执行时段冲突：「L3」(19:29-19:33) 与「L5」(19:30-19:35)" }
+  ],
+  "kept": []
+}
+```
+
+### 3. 假设不合法：整体拒绝（400，逐项列出）
+
+无效时间、重复假设、已完成 / 已跳过项、下界不满足可在同一响应中逐项返回；**不返回任何预演结果、不写数据**：
+
+```json
+HTTP 400
+{
+  "error": "BAD_INPUT",
+  "message": "假设校验未通过（3 项），本次预演已整体拒绝，请修改后重试",
+  "items": [
+    { "cueRef": 3, "code": "P1",
+      "reason": "「P1」已完成（实际完成 19:11），不能再填写假设预计结束" },
+    { "cueRef": 99, "code": null,
+      "reason": "提示项引用 99 不存在于当前执行版" },
+    { "cueRef": 4, "code": "L2",
+      "reason": "「L2」的假设预计结束 19:00 早于预演算出的开始 19:21" }
+  ]
+}
+```
+
+其他结构性错误（时间格式非 `HH:MM`、同一 cueRef 重复、`assumptions` 为空）同样返回 400 `BAD_INPUT`，消息中合并说明，例如：
+
+```json
+{ "error": "BAD_INPUT",
+  "message": "假设中提示项引用 4 重复（同一提示项只能填写一项假设）；提示项引用 5 的假设预计结束时间无效（应为 HH:MM）" }
+```
+
+已开始项的下界示例：`「S1」的假设预计结束 19:17 早于实际开始 19:18`；
+已跳过项：`「S2」已跳过，不能对其填写假设预计结束`。
+
+### 4. 版本或登记快照已变化：整体提示刷新（409，不返回混合时点结果）
+
+- 携带的 `versionId` 已不是当前执行版 → 409 `VERSION_STALE`；
+- `expectedRows` **缺少任一提示项**、含版本外引用，或**任一行版本与当前不一致**（预演期间有人登记 / 更正 / 跳过）→ 409 `SNAPSHOT_STALE`，响应逐项给出差异并附当前全量行版本，客户端应整体刷新页面后重新填写：
+
+```json
+HTTP 409
+{
+  "error": "SNAPSHOT_STALE",
+  "message": "执行版登记快照已变化（1 项），本次预演已整体拒绝，请刷新页面后重新填写",
+  "items": [
+    { "cueRef": 2, "code": "S1", "kind": "changed",
+      "expectedRowVersion": 1, "currentRowVersion": 2,
+      "reason": "「S1」登记行版本已变化（所见 v1，当前 v2，可能有岗位登记、舞监更正或跳过）" }
+  ],
+  "currentVersionId": 2, "currentVersionNo": 2,
+  "currentRows": [
+    { "cueRef": 1, "rowVersion": 1 }, { "cueRef": 2, "rowVersion": 2 },
+    { "cueRef": 3, "rowVersion": 3 }, { "cueRef": 4, "rowVersion": 1 }
+  ]
+}
+```
+
+`items[].kind`：`changed`（行版本变化）、`missing`（清单漏项）、`extra`（清单含版本外引用）。
+
+### 5. 错误一览
+
+| 场景 | 状态码 | error |
+| --- | --- | --- |
+| 非舞监调用 | 403 | `FORBIDDEN` |
+| 尚未发布任何版本 | 409 | `NO_LIVE_VERSION` |
+| 页面版本已归档（非当前执行版） | 409 | `VERSION_STALE` |
+| `expectedRows` 缺项 / 多项 / 任一行版本变化 | 409 | `SNAPSHOT_STALE`（附 `items` 与 `currentRows`） |
+| 版本不存在 / cueRef 非整数 | 404 / 400 | `NOT_FOUND` / `BAD_INPUT` |
+| `assumptions` 为空、缺 `expectedRows` | 400 | `BAD_INPUT` |
+| 时间无效、重复假设 | 400 | `BAD_INPUT`（消息合并说明） |
+| 已完成 / 已跳过项、未知 cueRef、假设早于实际开始 / 预演开始 | 400 | `BAD_INPUT`（`items` 逐项列出） |
 
 

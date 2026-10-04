@@ -160,3 +160,27 @@ tr.skipped-row td strong { color: #5b3a9a; }
 .src-tag.src-estimated { background: #fff3df; color: #9a6200; }
 .src-tag.src-duration { background: #e8eefc; color: #2f56c4; }
 .explain-skipped { margin: 6px 0; font-size: 12px; color: #5b3a9a; }
+
+/* 现场顺延预演（只读） */
+.head-actions { display: flex; gap: 8px; }
+.delay-legend { margin: 8px 0; line-height: 1.7; }
+.delay-form-wrap td, .delay-form-wrap th { font-size: 12px; vertical-align: middle; }
+.delay-form-wrap input[type="time"] { width: 96px; padding: 5px 8px; }
+tr.delay-running td { background: #fffaf0; }
+.assume-tag { display: inline-block; margin-left: 4px; font-size: 11px; color: #7a5200; background: #fff3df; border-radius: 6px; padding: 0 6px; }
+.delay-summary { background: #f3f0fb; border: 1px solid #cfc3ec; color: #4a3473; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
+.delay-assumptions { margin: 8px 0; font-size: 13px; }
+.delay-assumptions ul { margin: 4px 0; padding-left: 18px; }
+.delay-conf-grid { margin: 8px 0; }
+.delay-conf-box { margin-bottom: 0; }
+.delay-conf-box.has-add { background: #fdecea; border: 1px solid #e08a80; }
+.delay-conf-box.has-rm { background: #e9f8ef; border: 1px solid #b6e2c6; }
+.delay-conf-add li { color: #8f2418; margin: 3px 0; white-space: normal; }
+.delay-conf-rm li { color: #1d7a43; margin: 3px 0; white-space: normal; }
+.delay-kept { font-size: 12px; margin-bottom: 10px; }
+.delay-kept li { white-space: normal; margin: 4px 0; }
+.delay-result-wrap td, .delay-result-wrap th { font-size: 12px; vertical-align: top; }
+tr.delay-assumption-row td { background: #faf5e8; }
+tr.delay-changed-row td { font-weight: 500; }
+.delay-changed { white-space: normal; }
+.delta { color: #c0392b; font-size: 11px; font-weight: 700; }

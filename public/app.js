@@ -12,6 +12,7 @@ const state = {
   handoverLoading: false,
   deputies: null,
   skipPreview: null,
+  delayResult: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -503,6 +504,7 @@ function renderLive() {
     $('#live-conflicts').innerHTML = '';
     $('#live-deputy-banner').innerHTML = '';
     $('#deputy-panel').hidden = true;
+    $('#delay-preview-btn').hidden = true;
     $('#live-tbody').innerHTML = '';
     return;
   }
@@ -512,6 +514,7 @@ function renderLive() {
   renderConflicts(v.conflicts);
   renderDeputyBanner(v);
   renderDeputyPanel(v);
+  $('#delay-preview-btn').hidden = !(state.me.role === 'sm' && v.isLatest);
 
   const isOp = state.me.role === 'operator';
   const isSM = state.me.role === 'sm';
@@ -1122,6 +1125,177 @@ $('#modal-overlay').addEventListener('submit', async (ev) => {
       closeModal();
     } else {
       errBox.textContent = e.message;
+      errBox.hidden = false;
+    }
+  }
+});
+
+// ---------- 舞监：现场顺延预演（只读） ----------
+
+// 可填写假设的提示项：未开始（PENDING）或已开始（RUNNING）；已完成、已跳过不可填
+function delayEligibleCues(v) {
+  return v.cues.filter((c) => c.status === 'PENDING' || c.status === 'RUNNING');
+}
+
+function delayLowerHint(c) {
+  if (c.status === 'RUNNING') {
+    return `实际开始 ${c.actualStartText}（假设不得早于它）`;
+  }
+  return `当前重算开始 ${c.schedStartText}（假设不得早于预演算出的开始）`;
+}
+
+$('#delay-preview-btn').addEventListener('click', () => {
+  const v = state.live;
+  if (!v) return;
+  openDelayForm(v);
+});
+
+function openDelayForm(v) {
+  const eligible = delayEligibleCues(v);
+  const rows = eligible.map((c) => `
+    <tr data-delay-row="${c.id}" class="${c.status === 'RUNNING' ? 'delay-running' : ''}">
+      <td><strong>${esc(c.code)}</strong></td>
+      <td>${esc(c.title || '')}</td>
+      <td>${esc(c.position)}</td>
+      <td>${statusBadge(c.status)}</td>
+      <td class="mono">${esc(c.schedStartText)} - ${esc(c.schedEndText)}</td>
+      <td class="mono muted">${esc(delayLowerHint(c))}</td>
+      <td><input type="time" data-role="assume-ee" data-cue="${c.id}" /></td>
+    </tr>`).join('');
+  openModal('现场顺延预演：填写假设预计结束', `
+    <form id="delay-form">
+      <div class="muted">
+        当前执行版：<strong>第 ${v.versionNo} 版</strong>。对<strong>未完成、未跳过</strong>的一项或多项提示项填写
+        <strong>假设预计结束时间</strong>，系统以同一次读取的版本与全部登记行为基线，<strong>同时套用全部假设</strong>，
+        按现有前置与跳过规则重算，展示变更前后的待执行开始/结束及同岗位冲突（新增 / 消失）。
+      </div>
+      <div class="delay-legend muted">
+        已开始项的假设不得早于<strong>实际开始</strong>；未开始项不得早于<strong>预演算出的开始</strong>；
+        已完成 / 已跳过项不可填写。预演<strong>只读</strong>，不会更改登记、已发布计划、跳过与更正历史。
+      </div>
+      <div class="table-wrap delay-form-wrap">
+        <table>
+          <thead><tr>
+            <th>编号</th><th>说明</th><th>岗位</th><th>状态</th>
+            <th>变更前待执行时段</th><th>下界</th><th>假设预计结束</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div id="delay-err" class="error-text" hidden></div>
+      <div class="form-actions">
+        <button type="submit" class="warn">套用假设并重算</button>
+        <button type="button" class="ghost" id="delay-cancel">取消</button>
+      </div>
+    </form>`);
+  $('#delay-cancel').addEventListener('click', closeModal);
+}
+
+function fmtDelta(minutes) {
+  if (minutes === null || minutes === undefined) return '';
+  if (minutes === 0) return '±0 分';
+  const sign = minutes > 0 ? '+' : '';
+  return `${sign}${minutes} 分`;
+}
+
+function renderDelayResult(v, data) {
+  const conflictsHtml = (list, kind) => list.length
+    ? `<ul class="delay-conf-${kind}">${list.map((c) => `<li>${esc(typeof c === 'string' ? c : c.message)}</li>`).join('')}</ul>`
+    : '<div class="muted">无</div>';
+  const keptHtml = data.conflictDiff.kept.length
+    ? `<details class="delay-kept"><summary>保留冲突 ${data.conflictDiff.kept.length} 项（时段可能变化）</summary>
+         <ul>${data.conflictDiff.kept.map((k) => `<li><strong>${esc(k.position)}：${esc(k.codes.join(' / '))}</strong>
+           <div class="muted">变更前：${esc(k.beforeMessage)}</div><div class="muted">变更后：${esc(k.afterMessage)}</div></li>`).join('')}</ul>
+       </details>` : '';
+
+  const diffRows = data.cueDiffs.map((d) => {
+    const tag = d.assumption ? '<span class="assume-tag">假设项</span>' : '';
+    const sc = data.scenario.cues.find((c) => c.cueRef === d.cueRef);
+    const fieldMap = Object.fromEntries(d.fields.map((f) => [f.field, f]));
+    const cell = (key) => {
+      const f = fieldMap[key];
+      if (!f) return '<span class="muted">—</span>';
+      return `<div class="delay-changed">${esc(f.beforeText ?? '空')} → <strong>${esc(f.afterText ?? '空')}</strong> <span class="delta">${esc(fmtDelta(f.deltaMinutes))}</span></div>`;
+    };
+    const delayedCell = fieldMap.delayed
+      ? `<div class="delay-changed">${esc(fieldMap.delayed.beforeText)} → <strong>${esc(fieldMap.delayed.afterText)}</strong></div>`
+      : '<span class="muted">—</span>';
+    return `<tr class="${d.assumption ? 'delay-assumption-row' : ''} ${d.changed ? 'delay-changed-row' : ''}">
+      <td><strong>${esc(d.code)}</strong>${tag}</td>
+      <td>${esc(d.position)}</td>
+      <td>${statusBadge(d.status)}</td>
+      <td class="mono">${cell('schedStart')}</td>
+      <td class="mono">${cell('schedEnd')}</td>
+      <td>${delayedCell}</td>
+      <td class="mono muted">${esc(sc.plannedStartText)} - ${esc(sc.plannedEndText)}</td>
+    </tr>`;
+  }).join('');
+
+  const assumptionsHtml = data.assumptions.map((a) =>
+    `<li><strong>${esc(a.code)}</strong>（${esc(a.position)}·${esc(a.statusLabel)}）假设结束 <strong class="mono">${esc(a.assumedEndText)}</strong>
+      <span class="muted">开始 ${esc(a.actualStartText || a.scenarioStartText)}</span></li>`).join('');
+
+  openModal('顺延预演结果（只读，未落库）', `
+    <div class="delay-summary">${esc(data.summaryText)}</div>
+    <div class="muted">快照时刻 ${esc(data.snapshotAt)}｜第 ${data.versionNo} 版（当前执行版）｜
+      若期间有人登记 / 更正 / 跳过，请重新预演。</div>
+    <div class="delay-assumptions">本次假设（${data.assumptions.length} 项）：<ul>${assumptionsHtml}</ul></div>
+    <div class="grid2 delay-conf-grid">
+      <div class="panel delay-conf-box ${data.conflictDiff.added.length ? 'has-add' : ''}">
+        <h3>🆕 新增冲突（${data.conflictDiff.added.length}）</h3>${conflictsHtml(data.conflictDiff.added, 'add')}
+      </div>
+      <div class="panel delay-conf-box ${data.conflictDiff.removed.length ? 'has-rm' : ''}">
+        <h3>✅ 消失冲突（${data.conflictDiff.removed.length}）</h3>${conflictsHtml(data.conflictDiff.removed.map((c) => c.message), 'rm')}
+      </div>
+    </div>
+    ${keptHtml}
+    <div class="table-wrap delay-result-wrap">
+      <table>
+        <thead><tr>
+          <th>编号</th><th>岗位</th><th>状态</th><th>待执行开始（前 → 后）</th>
+          <th>待执行结束（前 → 后）</th><th>顺延标记</th><th>原计划</th>
+        </tr></thead>
+        <tbody>${diffRows}</tbody>
+      </table>
+    </div>
+    <div class="muted">该结果仅为预演：登记、已发布计划、跳过留痕与更正历史均未变化；关闭弹窗后现场仍以当前实际登记为准。</div>
+    <div class="form-actions">
+      <button type="button" class="primary" id="delay-back">修改假设</button>
+      <button type="button" class="ghost" id="delay-close">关闭</button>
+    </div>`);
+  $('#delay-close').addEventListener('click', closeModal);
+  $('#delay-back').addEventListener('click', () => openDelayForm(state.live));
+}
+
+$('#modal-overlay').addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#delay-form');
+  if (!form) return;
+  ev.preventDefault();
+  const v = state.live;
+  const errBox = $('#delay-err');
+  errBox.hidden = true;
+  const assumptions = [];
+  $$('#delay-form [data-role="assume-ee"]').forEach((inp) => {
+    if (inp.value) assumptions.push({ cueRef: Number(inp.dataset.cue), estimatedEndText: inp.value });
+  });
+  if (!assumptions.length) {
+    errBox.textContent = '请至少为一项提示项填写假设预计结束时间';
+    errBox.hidden = false;
+    return;
+  }
+  const expectedRows = v.cues.map((c) => ({ cueRef: c.id, rowVersion: c.rowVer }));
+  try {
+    const data = await api('POST', '/api/live/delay-preview', { versionId: v.id, expectedRows, assumptions });
+    state.delayResult = data;
+    renderDelayResult(v, data);
+  } catch (e) {
+    if (e.status === 409) {
+      // 执行版或登记行已变化：整体提示刷新，不呈现混合时点结果
+      alertBar('error', errorToHtml(e), 10000);
+      closeModal();
+      loadLive().then(renderLive).catch(() => {});
+    } else {
+      errBox.innerHTML = errorToHtml(e);
       errBox.hidden = false;
     }
   }

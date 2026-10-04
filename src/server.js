@@ -1394,6 +1394,319 @@ function closureSizeFor(versionId, rootRef) {
   return successorClosure(versionId, rootRef).size;
 }
 
+// ---------- 舞监：现场顺延预演（仅当前执行版，只读） ----------
+
+const DELAY_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: '已完成', SKIPPED: '已跳过' };
+
+// 预演结果中的精简提示项（同构于现场负载的时间字段，不含更正历史等只读无关内容）
+function delayCueJson(c, overrides = {}) {
+  return {
+    cueRef: c.id,
+    code: c.code,
+    title: c.title,
+    position: c.position,
+    status: c.status,
+    statusLabel: DELAY_STATUS_LABEL[c.status] || c.status,
+    plannedStartText: minToTime(c.plannedStart),
+    plannedEndText: minToTime(c.plannedStart + c.duration),
+    schedStartText: minToTime(c.schedStart),
+    schedEndText: minToTime(c.schedEnd),
+    delayed: c.delayed === true,
+    actualStartText: minToTime(c.actualStart),
+    actualEndText: minToTime(c.actualEnd),
+    estimatedEndText: minToTime(c.estimatedEnd),
+    ...overrides,
+  };
+}
+
+// 冲突身份键：岗位 + 双方编号（升序）。消息内含时刻，不能直接用于前后对照
+function conflictKey(cf) {
+  return `${cf.position}|${[...cf.codes].sort().join('|')}`;
+}
+
+/**
+ * 现场顺延预演：以同一次读取的当前执行版与全部登记行为基线，
+ * 同时套用舞监填写的多项「假设预计结束」后按现有前置/跳过规则整体重算，
+ * 对照变更前后的待执行开始/结束与同岗位冲突。只读，不写任何数据。
+ */
+app.post('/api/live/delay-preview', requireSM, (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const versionId = Number(body.versionId);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的联排版本 versionId');
+    const rawExpected = body.expectedRows;
+    const rawAssumptions = body.assumptions;
+    if (!Array.isArray(rawExpected)) {
+      throw new ApiError(400, 'BAD_INPUT', '请求须携带所见全部提示项登记行版本 expectedRows: [{cueRef, rowVersion}]');
+    }
+    if (!Array.isArray(rawAssumptions) || rawAssumptions.length === 0) {
+      throw new ApiError(400, 'BAD_INPUT', '请至少填写一项未完成、未跳过提示项的假设预计结束时间');
+    }
+
+    const result = db.transaction(() => {
+      // 1) 执行版必须仍是当前执行版
+      const latest = latestPublishedVersion();
+      if (!latest) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本，无法预演');
+      const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      if (latest.id !== verRow.id) {
+        throw new ApiError(409, 'VERSION_STALE',
+          `页面基于的第 ${verRow.version_no} 版已不是当前执行版（当前为第 ${latest.version_no} 版），请刷新后再预演`,
+          { currentVersionId: latest.id, currentVersionNo: latest.version_no });
+      }
+
+      // 2) 同一次读取当前版本冻结计划与全部登记快照（基线与场景共用）
+      const { cues, deps, regMap } = versionInputs(verRow.id);
+      const cueMap = new Map(cues.map((c) => [c.id, c]));
+      const snapshotAt = new Date().toLocaleString('sv-SE');
+
+      // 3) 请求必须携带所见版本及【全部】提示项登记行版本：缺项/多项/任一行变化 → 整体提示刷新
+      const parseRowList = (list, label) => {
+        const map = new Map();
+        const shapeErrors = [];
+        for (const it of list) {
+          const ref = Number(it?.cueRef);
+          const rv = Number(it?.rowVersion);
+          if (!Number.isInteger(ref) || !Number.isInteger(rv)) {
+            shapeErrors.push(`存在不含整数 cueRef / rowVersion 的${label}项`);
+            continue;
+          }
+          if (map.has(ref)) shapeErrors.push(`${label}中提示项引用 ${ref} 重复`);
+          map.set(ref, rv);
+        }
+        return { map, shapeErrors };
+      };
+      const expected = parseRowList(rawExpected, '登记行版本清单');
+      if (expected.shapeErrors.length) {
+        throw new ApiError(400, 'BAD_INPUT', expected.shapeErrors.join('；'));
+      }
+      const staleItems = [];
+      for (const ref of regMap.keys()) {
+        if (!expected.map.has(ref)) {
+          staleItems.push({ cueRef: ref, code: cueMap.get(ref)?.code ?? null, kind: 'missing',
+            reason: `缺少提示项「${cueMap.get(ref)?.code || ref}」的登记行版本（expectedRows 必须包含当前版本全部提示项）` });
+        }
+      }
+      for (const [ref, rv] of expected.map) {
+        const reg = regMap.get(ref);
+        if (!reg) {
+          staleItems.push({ cueRef: ref, code: null, kind: 'extra',
+            reason: `携带了当前执行版不存在的提示项引用 ${ref}` });
+          continue;
+        }
+        if (rv !== reg.rowVer) {
+          staleItems.push({ cueRef: ref, code: cueMap.get(ref)?.code ?? null, kind: 'changed',
+            expectedRowVersion: rv, currentRowVersion: reg.rowVer,
+            reason: `「${cueMap.get(ref)?.code || ref}」登记行版本已变化（所见 v${rv}，当前 v${reg.rowVer}，可能有岗位登记、舞监更正或跳过）` });
+        }
+      }
+      if (staleItems.length) {
+        throw new ApiError(409, 'SNAPSHOT_STALE',
+          `执行版登记快照已变化（${staleItems.length} 项），本次预演已整体拒绝，请刷新页面后重新填写`,
+          {
+            items: staleItems,
+            currentVersionId: verRow.id,
+            currentVersionNo: verRow.version_no,
+            currentRows: [...regMap.entries()].map(([ref, r]) => ({ cueRef: ref, rowVersion: r.rowVer })),
+          });
+      }
+
+      // 4) 解析并整体校验全部假设（无效时间/重复/已完成/已跳过/早于下界逐项列出，任一不合法均不返回预演结果）
+      const assumptions = [];
+      const seenRefs = new Set();
+      const shapeErrors = [];
+      for (const it of rawAssumptions) {
+        const ref = Number(it?.cueRef);
+        if (!Number.isInteger(ref)) { shapeErrors.push('存在不含有效整数 cueRef 的假设项'); continue; }
+        if (seenRefs.has(ref)) shapeErrors.push(`假设中提示项引用 ${ref} 重复（同一提示项只能填写一项假设）`);
+        seenRefs.add(ref);
+        const text = String(it?.estimatedEndText ?? '').trim();
+        const ee = timeToMin(text);
+        if (ee === null) shapeErrors.push(`提示项引用 ${ref} 的假设预计结束时间无效（应为 HH:MM）`);
+        assumptions.push({ cueRef: ref, estimatedEndText: text, estimatedEnd: ee });
+      }
+      if (shapeErrors.length) throw new ApiError(400, 'BAD_INPUT', shapeErrors.join('；'));
+
+      // 先以基线重算，得到未开始项的当前开始；再套用全部假设得到场景（下界校验用场景开始）
+      const baseline = computeLive(cues, deps, regMap);
+      const scenarioRegMap = new Map();
+      for (const [ref, r] of regMap) scenarioRegMap.set(ref, { ...r });
+      const assumedRefs = new Set();
+      for (const a of assumptions) {
+        const reg = scenarioRegMap.get(a.cueRef);
+        if (!reg || !cueMap.has(a.cueRef)) {
+          // 未知引用在下方 itemErrors 中统一报告
+          continue;
+        }
+        reg.estimatedEnd = a.estimatedEnd;
+        assumedRefs.add(a.cueRef);
+      }
+      const scenario = computeLive(cues, deps, scenarioRegMap);
+      const baseById = new Map(baseline.cues.map((c) => [c.id, c]));
+      const scenById = new Map(scenario.cues.map((c) => [c.id, c]));
+
+      const itemErrors = [];
+      for (const a of assumptions) {
+        const cue = cueMap.get(a.cueRef);
+        const reg = regMap.get(a.cueRef);
+        if (!cue || !reg) {
+          itemErrors.push({ cueRef: a.cueRef, code: cue?.code ?? null,
+            reason: `提示项引用 ${a.cueRef} 不存在于当前执行版` });
+          continue;
+        }
+        if (reg.skipped === true || reg.skipped === 1) {
+          itemErrors.push({ cueRef: a.cueRef, code: cue.code,
+            reason: `「${cue.code}」已跳过，不能对其填写假设预计结束` });
+          continue;
+        }
+        if (reg.actualEnd !== null) {
+          itemErrors.push({ cueRef: a.cueRef, code: cue.code,
+            reason: `「${cue.code}」已完成（实际完成 ${minToTime(reg.actualEnd)}），不能再填写假设预计结束` });
+          continue;
+        }
+        if (reg.actualStart !== null) {
+          // 已开始项：假设不得早于实际开始
+          if (a.estimatedEnd < reg.actualStart) {
+            itemErrors.push({ cueRef: a.cueRef, code: cue.code,
+              reason: `「${cue.code}」的假设预计结束 ${a.estimatedEndText} 早于实际开始 ${minToTime(reg.actualStart)}` });
+          }
+          continue;
+        }
+        // 未开始项：假设不得早于预演算出的开始（场景值，含其他假设经前置链带来的顺延）
+        const sc = scenById.get(a.cueRef);
+        if (sc && a.estimatedEnd < sc.schedStart) {
+          itemErrors.push({ cueRef: a.cueRef, code: cue.code,
+            reason: `「${cue.code}」的假设预计结束 ${a.estimatedEndText} 早于预演算出的开始 ${minToTime(sc.schedStart)}` });
+        }
+      }
+      if (itemErrors.length) {
+        throw new ApiError(400, 'BAD_INPUT',
+          `假设校验未通过（${itemErrors.length} 项），本次预演已整体拒绝，请修改后重试`,
+          { items: itemErrors });
+      }
+
+      // 5) 逐项差异：待执行开始/结束、顺延标记，以及假设项自身的预计结束变化
+      const cueDiffs = [];
+      const changedCueRefs = [];
+      const delayedLabel = (v) => (v ? '已顺延' : '按时');
+      for (const bc of baseline.cues) {
+        const sc = scenById.get(bc.id);
+        const reg = regMap.get(bc.id);
+        const isAssumption = assumedRefs.has(bc.id);
+        const fields = [];
+        if (bc.schedStart !== sc.schedStart) {
+          fields.push({ field: 'schedStart', label: '待执行开始',
+            beforeText: minToTime(bc.schedStart), afterText: minToTime(sc.schedStart),
+            deltaMinutes: sc.schedStart - bc.schedStart });
+        }
+        if (bc.schedEnd !== sc.schedEnd) {
+          fields.push({ field: 'schedEnd', label: '待执行结束',
+            beforeText: minToTime(bc.schedEnd), afterText: minToTime(sc.schedEnd),
+            deltaMinutes: sc.schedEnd - bc.schedEnd });
+        }
+        if (bc.delayed !== sc.delayed) {
+          fields.push({ field: 'delayed', label: '顺延标记',
+            beforeText: delayedLabel(bc.delayed), afterText: delayedLabel(sc.delayed) });
+        }
+        if (isAssumption) {
+          fields.push({ field: 'estimatedEnd', label: '假设预计结束',
+            beforeText: minToTime(reg.estimatedEnd), afterText: minToTime(sc.estimatedEnd),
+            deltaMinutes: reg.estimatedEnd === null ? null : sc.estimatedEnd - reg.estimatedEnd });
+        }
+        const changed = fields.some((f) => f.field !== 'estimatedEnd');
+        if (changed) changedCueRefs.push(bc.id);
+        cueDiffs.push({
+          cueRef: bc.id,
+          code: bc.code,
+          title: bc.title,
+          position: bc.position,
+          status: sc.status,
+          statusLabel: DELAY_STATUS_LABEL[sc.status] || sc.status,
+          changed,
+          assumption: isAssumption,
+          delayedBefore: bc.delayed === true,
+          delayedAfter: sc.delayed === true,
+          fields,
+        });
+      }
+
+      // 6) 同岗位冲突的新增 / 消失 / 保留（按身份键对照；消息内含时刻，保留双方消息）
+      const beforeMap = new Map(baseline.conflicts.map((c) => [conflictKey(c), c]));
+      const afterMap = new Map(scenario.conflicts.map((c) => [conflictKey(c), c]));
+      const added = [], removed = [], kept = [];
+      for (const [k, c] of afterMap) {
+        if (!beforeMap.has(k)) added.push(c);
+        else kept.push({ position: c.position, codes: c.codes, beforeMessage: beforeMap.get(k).message, afterMessage: c.message });
+      }
+      for (const [k, c] of beforeMap) if (!afterMap.has(k)) removed.push(c);
+
+      return {
+        verRow,
+        snapshotAt,
+        assumptions: assumptions.map((a) => {
+          const c = cueMap.get(a.cueRef);
+          const sc = scenById.get(a.cueRef);
+          return {
+            cueRef: a.cueRef,
+            code: c.code,
+            title: c.title,
+            position: c.position,
+            status: sc.status,
+            actualStartText: minToTime(sc.actualStart),
+            scenarioStartText: minToTime(sc.schedStart),
+            assumedEndText: a.estimatedEndText,
+          };
+        }),
+        baseline: {
+          cues: baseline.cues.map((c) => delayCueJson(c)),
+          conflicts: baseline.conflicts,
+        },
+        scenario: {
+          cues: scenario.cues.map((c) => delayCueJson(c, assumedRefs.has(c.id)
+            ? { assumptionApplied: true, assumedEndText: minToTime(c.estimatedEnd) } : { assumptionApplied: false })),
+          conflicts: scenario.conflicts,
+        },
+        cueDiffs,
+        changedCueRefs,
+        conflictDiff: {
+          beforeCount: baseline.conflicts.length,
+          afterCount: scenario.conflicts.length,
+          added,
+          removed,
+          kept,
+        },
+        summary: {
+          assumptionCount: assumptions.length,
+          cuesChanged: changedCueRefs.length,
+          conflictsAdded: added.length,
+          conflictsRemoved: removed.length,
+          conflictsKept: kept.length,
+          conflictsBefore: baseline.conflicts.length,
+          conflictsAfter: scenario.conflicts.length,
+        },
+      };
+    })();
+
+    res.json({
+      readOnly: true,
+      versionId: result.verRow.id,
+      versionNo: result.verRow.version_no,
+      isLatest: true,
+      snapshotAt: result.snapshotAt,
+      assumptions: result.assumptions,
+      baseline: result.baseline,
+      scenario: result.scenario,
+      cueDiffs: result.cueDiffs,
+      changedCueRefs: result.changedCueRefs,
+      conflictDiff: result.conflictDiff,
+      summary: result.summary,
+      summaryText: `已同时套用 ${result.summary.assumptionCount} 项假设重算：待执行时段变化 ${result.summary.cuesChanged} 项；`
+        + `同岗位冲突由 ${result.summary.conflictsBefore} 项变为 ${result.summary.conflictsAfter} 项`
+        + `（新增 ${result.summary.conflictsAdded}、消失 ${result.summary.conflictsRemoved}）。预演为只读，未改动登记、计划与更正历史。`,
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 静态页面与错误处理 ----------
 
 app.use(express.static(path.join(__dirname, '..', 'public')));
